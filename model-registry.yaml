@@ -1,0 +1,80 @@
+registry:
+  name: northstar-models
+  backend: mlflow          # self-hosted MLflow on EKS; artifact store is S3 (s3://northstar-mlflow-artifacts)
+  stages:
+
+    - name: staging
+      promoted_from: successful training run (run_id registered by CD pipeline post-evaluation)
+      promotion_rule: automatic
+      gates:
+        # ETA model gates (evaluated on frozen holdout set; holdout is locked at dataset_hash and never reused for training)
+        - eta_mae_p95_minutes <= 4.2          # p95 of |predicted - actual| across all holdout routes
+        - eta_mae_per_city_bottom3 <= 6.0     # worst-3 cities by volume must each pass; prevents metro-bias
+        - eta_data_drift_psi < 0.1            # PSI on top-5 features vs. training distribution; rejects stale-data runs
+        - unit_tests_pass: true               # pytest suite in CI must be green on the training commit
+        # Dispatcher routing model gates
+        - dispatcher_macro_f1 >= 0.82
+        - dispatcher_per_city_f1_bottom3 >= 0.70
+        - dispatcher_precision_top_courier >= 0.88  # precision on the courier ranked #1 (business-critical slot)
+        - unit_tests_pass: true
+
+    - name: production
+      promoted_from: staging
+      promotion_rule: manual
+      gates:
+        - canary_p95_latency_ms <= 150        # measured over 1-hour canary window at 5% traffic (ETA model)
+        - canary_error_rate_pct <= 0.1        # HTTP 5xx rate during canary window
+        - canary_eta_mae_live <= 4.5          # live MAE on canary traffic (slightly relaxed vs holdout; accounts for covariate shift)
+        - dispatcher_canary_p95_latency_ms <= 80
+        - no_open_sev1_incidents: true        # no active incidents tagged to this model version in PagerDuty
+      approvers:
+        - ml-lead              # reviews holdout metrics, slice analysis, and canary report
+        - on-call-engineer     # confirms infra health and rollback readiness before promotion
+
+    - name: archived
+      promoted_from: production
+      archival_triggers:
+        - a newer version has been in Production for >= 30 days
+        - manual archival by ml-lead (e.g. compliance or data-lineage violation discovered)
+        - model fails a scheduled monthly re-evaluation against current data distribution (MAE degrades > 15% vs. production baseline)
+
+models:
+  - name: eta
+    owner: ml-team
+    serving_pattern: online
+    sla_p95_ms: 150
+    peak_rps: 200
+    retrain_cadence: every 2 weeks (or on drift alert; whichever comes first)
+    retention_versions: 10          # older versions auto-archived beyond this count
+    framework: onnx                 # exported from PyTorch; served via ONNX Runtime on SageMaker Endpoints
+    feature_store_keys:
+      - trip_origin_zone
+      - trip_distance_km
+      - traffic_index_realtime
+      - historical_route_eta_p50
+      - time_of_day_bucket
+
+  - name: dispatcher-routing
+    owner: ml-team
+    serving_pattern: online
+    sla_p95_ms: 80
+    peak_rps: 50
+    retrain_cadence: monthly (or on drift alert)
+    retention_versions: 10
+    framework: onnx
+    feature_store_keys:
+      - courier_current_load
+      - courier_zone_affinity_score
+      - pickup_zone
+      - estimated_courier_distance_km
+      - courier_acceptance_rate_7d
+
+lineage:
+  required_fields:
+    - git_sha           # exact commit hash of the training code; enforced by the CI registration step
+    - dataset_hash      # SHA-256 of the DVC-tracked dataset version used for training
+    - dvc_remote_url    # S3 URI pointing to the exact DVC cache entry (e.g. s3://northstar-dvc/files/md5/...)
+    - mlflow_run_id     # links artifact back to full params, metrics, and environment snapshot in MLflow
+    - base_image_digest # Docker image SHA used for the training job (e.g. sha256:abc123...) — pins Python + library versions
+    - random_seed       # integer seed passed to all stochastic components (model init, data shuffling)
+  enforcement: registration blocked if any required field is missing (MLflow plugin hook)
